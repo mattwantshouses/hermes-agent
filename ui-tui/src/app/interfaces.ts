@@ -172,6 +172,13 @@ export type SubscriptionStepUpRetry =
   | { kind: 'preview'; tierId: string }
   | { kind: 'resume' }
 
+/** Outcome of a terminal-billing step-up: granted, plus the typed denial (for copy). */
+export interface StepUpResult {
+  granted: boolean
+  error?: string
+  message?: string
+}
+
 export interface SubscriptionOverlayCtx {
   /** Build {portal}/manage-subscription?org_id=… locally and open it. Resolves ok/false. */
   openManageLink: () => Promise<boolean>
@@ -191,10 +198,11 @@ export interface SubscriptionOverlayCtx {
   upgrade: (tierId: string, idempotencyKey?: string) => Promise<SubscriptionUpgradeResponse | null>
   /**
    * Run the `billing.step_up` device flow (grant terminal billing / "Remote
-   * Spending"). Resolves `true` when the grant lands. The browser opens via the
+   * Spending"). Resolves `{granted}` plus the typed denial (`error`/`message`) so
+   * the stepup screen shows the right recovery. The browser opens via the
    * gateway's out-of-band verification event — the stepup screen just awaits.
    */
-  requestRemoteSpending: () => Promise<boolean>
+  requestRemoteSpending: () => Promise<StepUpResult>
   /** Emit a transcript system line. */
   sys: (text: string) => void
 }

@@ -79,7 +79,7 @@ const ctx = {
   openPortal: vi.fn(),
   preview: vi.fn(() => Promise.resolve(null)),
   refreshState: vi.fn(() => Promise.resolve(null)),
-  requestRemoteSpending: vi.fn(() => Promise.resolve(true)),
+  requestRemoteSpending: vi.fn(() => Promise.resolve({ granted: true })),
   resume: vi.fn(() => Promise.resolve(null)),
   scheduleCancellation: vi.fn(() => Promise.resolve(null)),
   scheduleChange: vi.fn(() => Promise.resolve(null)),

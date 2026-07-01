@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 import { Box, Text, useInput } from '@hermes/ink'
 import { useRef, useState } from 'react'
 
@@ -138,7 +140,15 @@ function mutationResult(r: null | { message?: string; ok?: boolean }, okMessage:
 /** Map an upgrade response, routing SCA / decline to a portal recovery. */
 function upgradeResult(r: null | SubscriptionUpgradeResponse): SubscriptionResult {
   if (!r) {
-    return { message: 'The upgrade could not be completed.', ok: false }
+    // null = a transport failure (WS drop / request timeout) on the CHARGING
+    // route — NAS may have already prorated + charged. Report it as ambiguous and
+    // steer to a safe re-check, never a blind retry (which #2's dedup can't cover
+    // once the key is lost).
+    return {
+      message:
+        'Couldn’t confirm the upgrade — your card may or may not have been charged. Re-run /subscription to check your plan before trying again.',
+      ok: false
+    }
   }
 
   if (r.ok && (r.status === 'already_on_tier' || r.status === 'upgraded')) {
@@ -170,6 +180,27 @@ function upgradeResult(r: null | SubscriptionUpgradeResponse): SubscriptionResul
   return errorResult(r)
 }
 
+/** Map a failed terminal-billing step-up to the right recovery copy (typed). */
+function stepUpDenialResult(res: { error?: string; message?: string }): SubscriptionResult {
+  if (res.error === 'session_revoked') {
+    return { message: 'Your session expired — run /portal to log in again, then retry the change.', ok: false }
+  }
+
+  if (res.error === 'remote_spending_revoked') {
+    return { message: res.message || 'Terminal spending was turned off for this session — reconnect from the portal, then retry.', ok: false }
+  }
+
+  if (res.error === 'rate_limited') {
+    return { message: 'Too many attempts — wait a moment, then try again.', ok: false }
+  }
+
+  return {
+    message:
+      res.message || 'Terminal billing was not enabled — an org admin/owner must allow it for this org. You can also make this change on the portal.',
+    ok: false
+  }
+}
+
 // ── Scope-aware routing (shared by the picker, confirm, overview + step-up) ──
 
 /** Preview a tier and route: confirm (ok), stepup (scope), or result (other error). */
@@ -194,7 +225,16 @@ function previewAndRoute(
     // charge_now ⇒ an upgrade (charges now); everything else schedules at period
     // end. blocked/no_op still go to confirm, which shows why + no apply.
     const kind = p.effect === 'charge_now' ? 'upgrade' : 'tier_change'
-    onPatch({ pending: { kind, preview: p, targetTierId: tierId }, screen: 'confirm' })
+
+    // Mint the upgrade idempotency key HERE so it rides `pending` into confirm AND
+    // the step-up replay — a re-submit / post-grant replay dedups server-side
+    // (mirrors billingOverlay's pendingCharge.idempotencyKey).
+    const pending: SubscriptionPendingChange =
+      kind === 'upgrade'
+        ? { idempotencyKey: randomUUID(), kind, preview: p, targetTierId: tierId }
+        : { kind, preview: p, targetTierId: tierId }
+
+    onPatch({ pending, screen: 'confirm' })
   })
 }
 
@@ -482,7 +522,16 @@ function ConfirmScreen({ onClose, onPatch, overlay, t }: ScreenProps) {
   // React commits, double-firing the mutation/charge.
   const submittingRef = useRef(false)
 
-  const back = () => onPatch({ pending: null, screen: isCancellation ? 'overview' : 'picker' })
+  const back = () => {
+    // Don't navigate away while an apply is in flight: the screen hasn't changed
+    // yet (applyPendingAndRoute patches only after the RPC resolves), so a fresh
+    // re-mount would re-fire the mutation — a second charge on the upgrade path.
+    if (submittingRef.current) {
+      return
+    }
+
+    onPatch({ pending: null, screen: isCancellation ? 'overview' : 'picker' })
+  }
 
   const apply = () => {
     if (submittingRef.current || !pending) {
@@ -626,8 +675,12 @@ function ResultScreen({ onClose, overlay, t }: Omit<ScreenProps, 'onPatch'>) {
 function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
   const { ctx } = overlay
   const retry: null | SubscriptionStepUpRetry = overlay.stepUpRetry ?? null
-  const [phase, setPhase] = useState<'prompt' | 'waiting'>('prompt')
+  const [phase, setPhase] = useState<'granted' | 'prompt' | 'waiting'>('prompt')
   const startedRef = useRef(false)
+  // Set when the user cancels while the browser grant is still in flight. The
+  // grant's late `.then` MUST NOT fire the held change after a cancel — otherwise
+  // a cancel-then-approve charges the card the user just declined.
+  const abortedRef = useRef(false)
 
   const enable = () => {
     if (startedRef.current) {
@@ -636,41 +689,56 @@ function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
 
     startedRef.current = true
     setPhase('waiting')
-    void ctx.requestRemoteSpending().then(granted => {
-      if (!granted) {
-        return onPatch({
-          result: {
-            message:
-              'Terminal billing was not enabled — an org admin/owner must allow it for this org. You can also make this change on the portal.',
-            ok: false
-          },
-          screen: 'result',
-          stepUpRetry: null
-        })
+    void ctx.requestRemoteSpending().then(res => {
+      if (abortedRef.current) {
+        return
       }
 
-      // Granted → replay the held action.
-      onPatch({ stepUpRetry: null })
-
-      if (!retry) {
-        return onPatch({ screen: 'overview' })
+      if (res.granted) {
+        // HOLD — do not auto-fire the held change. Require an explicit Continue so
+        // a cancelled/late grant can never charge (mirrors billingOverlay's
+        // 'granted' phase). The user already consented at confirm; this reconfirms.
+        return setPhase('granted')
       }
 
-      if (retry.kind === 'preview') {
-        return void previewAndRoute(ctx, retry.tierId, onPatch)
-      }
-
-      if (retry.kind === 'resume') {
-        return void resumeAndRoute(ctx, onPatch)
-      }
-
-      return void applyPendingAndRoute(ctx, overlay.pending ?? null, onPatch)
+      // Typed denial (session_revoked / remote_spending_revoked / rate_limited /
+      // admin-approval) → the right recovery copy, not a flat "admin must allow".
+      onPatch({ result: stepUpDenialResult(res), screen: 'result', stepUpRetry: null })
     })
   }
 
-  const back = () => onPatch({ screen: retry?.kind === 'apply' ? 'confirm' : 'overview', stepUpRetry: null })
+  const resume = () => {
+    onPatch({ stepUpRetry: null })
 
-  const rows: Row[] = phase === 'prompt' ? [{ color: t.color.ok, label: 'Enable terminal billing', run: enable }, { label: 'Cancel', run: back }] : []
+    if (!retry) {
+      return onPatch({ screen: 'overview' })
+    }
+
+    if (retry.kind === 'preview') {
+      return void previewAndRoute(ctx, retry.tierId, onPatch)
+    }
+
+    if (retry.kind === 'resume') {
+      return void resumeAndRoute(ctx, onPatch)
+    }
+
+    return void applyPendingAndRoute(ctx, overlay.pending ?? null, onPatch)
+  }
+
+  const back = () => {
+    // Abandon. If a grant is in flight, mark it aborted so its .then no-ops (no
+    // un-consented charge); if already granted, just leave without replaying.
+    abortedRef.current = true
+    onPatch({ screen: retry?.kind === 'apply' ? 'confirm' : 'overview', stepUpRetry: null })
+  }
+
+  const rows: Row[] =
+    phase === 'granted'
+      ? [{ color: t.color.ok, label: retry?.kind === 'apply' ? 'Continue the change' : 'Continue', run: resume }, { label: 'Cancel', run: back }]
+      : phase === 'prompt'
+        ? [{ color: t.color.ok, label: 'Enable terminal billing', run: enable }, { label: 'Cancel', run: back }]
+        : []
+
   const sel = useMenu(rows, back)
 
   return (
@@ -678,24 +746,22 @@ function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
       <Text bold color={t.color.accent}>
         Terminal billing
       </Text>
-      {phase === 'prompt' ? (
+      {phase === 'prompt' && (
         <>
           <Text color={t.color.text}>Changing your plan needs terminal billing enabled for this org. Enable it here, then continue.</Text>
-          <Text color={t.color.muted}>An org admin/owner approves it once; the change resumes automatically.</Text>
-          <Text />
-          {rows.map((row, i) => (
-            <ActionRow active={sel === i} color={row.color} key={row.label} label={row.label} t={t} />
-          ))}
-          <Text />
-          {footer('↑/↓ select · Enter · Esc back', t)}
-        </>
-      ) : (
-        <>
-          <Text color={t.color.muted}>Opening your browser to approve… finish there; your change resumes automatically.</Text>
-          <Text />
-          {footer('Waiting for approval… · Esc to cancel', t)}
+          <Text color={t.color.muted}>An org admin/owner approves it once in the browser.</Text>
         </>
       )}
+      {phase === 'waiting' && (
+        <Text color={t.color.muted}>Opening your browser to approve… finish there, then come back — nothing is charged until you continue.</Text>
+      )}
+      {phase === 'granted' && <Text color={t.color.ok}>Terminal billing enabled. Continue to finish your change.</Text>}
+      <Text />
+      {rows.map((row, i) => (
+        <ActionRow active={sel === i} color={row.color} key={row.label} label={row.label} t={t} />
+      ))}
+      <Text />
+      {footer(phase === 'waiting' ? 'Waiting for approval… · Esc to cancel' : '↑/↓ select · Enter · Esc back', t)}
     </Box>
   )
 }
