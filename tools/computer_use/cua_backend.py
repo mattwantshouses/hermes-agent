@@ -830,13 +830,23 @@ class _CuaDriverSession:
 
     @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
-        """Return True for MCP/stdio failures that are recoverable by reconnecting."""
+        """Return True for MCP/stdio failures that are recoverable by reconnecting.
+
+        Includes TimeoutError: a wedged proxy (transport neither closed nor
+        responsive) surfaces as `concurrent.futures.TimeoutError` from
+        `_AsyncBridge.run`'s `fut.result(timeout=...)`, not as one of the
+        "closed" exceptions below — so without this it would time out on
+        every call forever instead of ever triggering a reconnect (see
+        2026-07-07 incident: daemon healthy, proxy hung, doctor green,
+        `computer_use` calls stuck at 30s TimeoutError until a manual
+        `pkill -f 'cua-driver mcp'` + gateway restart).
+        """
         name = exc.__class__.__name__
         module = getattr(exc.__class__, "__module__", "")
         return (
             name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
             or (module.startswith("anyio") and "Resource" in name)
-            or isinstance(exc, (BrokenPipeError, EOFError))
+            or isinstance(exc, (BrokenPipeError, EOFError, concurrent.futures.TimeoutError, TimeoutError))
         )
 
     @staticmethod
