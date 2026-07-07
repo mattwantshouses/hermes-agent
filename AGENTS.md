@@ -1,5 +1,13 @@
 # Hermes Agent - Development Guide
 
+> **Local branch policy (read first):** this checkout mirrors
+> `NousResearch`'s upstream directly on `main` — never commit to `main`.
+> All local work goes on `matt/cua-timeout-reconnect-fix` (or a new
+> `matt/<topic>` branch off current `main`). Full policy + why:
+> `CLAUDE.md` in this repo root (same content as `GEMINI.md`). This note
+> is committed only on `matt/cua-timeout-reconnect-fix`, never on `main`
+> — `main`'s copy of this file stays byte-identical to `origin/main`.
+
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
 **Never give up on the right solution.**
