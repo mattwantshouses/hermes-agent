@@ -1720,6 +1720,14 @@ class CuaDriverBackend(ComputerUseBackend):
     # ── Introspection ──────────────────────────────────────────────
     def list_apps(self) -> List[Dict[str, Any]]:
         out = self._session.call_tool("list_apps", {"session": self._session_id})
+        # structuredContent carries the full per-app record and is what
+        # newer cua-driver builds emit; prefer it the same way focus_app/
+        # capture prefer structuredContent for list_windows, instead of
+        # relying solely on parsing the human-readable text lines below
+        # (which silently yields [] if the driver's text format changes).
+        structured = out.get("structuredContent") or {}
+        if isinstance(structured.get("apps"), list):
+            return structured["apps"]
         data = out["data"]
         if isinstance(data, list):
             return data
@@ -1729,7 +1737,7 @@ class CuaDriverBackend(ComputerUseBackend):
         if isinstance(data, str):
             apps = []
             for line in data.splitlines():
-                m = re.search(r'(.+?)\s+\(pid\s+(\d+)\)', line)
+                m = re.search(r'^-\s*(.+?)\s+\(pid\s+(\d+)\)', line)
                 if m:
                     apps.append({"name": m.group(1).strip(), "pid": int(m.group(2))})
             return apps
