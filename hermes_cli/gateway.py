@@ -3895,10 +3895,10 @@ def generate_launchd_plist() -> str:
     <true/>
     
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
-    
+    <string>{log_dir}/gateway-service-stdout.log</string>
+
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>{log_dir}/gateway-service-stderr.log</string>
 </dict>
 </plist>
 """
